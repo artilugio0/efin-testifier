@@ -18,6 +18,13 @@ type HTTPRequest struct {
 	Body    string
 }
 
+// HTTPResponse represents the structure of an HTTP response to Lua.
+type HTTPResponse struct {
+	StatusCode int
+	Headers    map[string]string
+	Body       string
+}
+
 func main() {
 	// Check if a Lua file is provided as an argument.
 	if len(os.Args) != 2 {
@@ -31,13 +38,24 @@ func main() {
 	L := lua.NewState()
 	defer L.Close()
 
+	// Register runtime functions for tests.
+	registerRuntimeFunctions(L)
+
 	// Load and execute the Lua file.
 	if err := L.DoFile(luaFile); err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading Lua file: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Get the global "request" table.
+	// Check for test functions (functions with "test_" prefix).
+	testFunctions := findTestFunctions(L)
+	if len(testFunctions) > 0 {
+		// Run tests and report results.
+		runTests(L, testFunctions)
+		return
+	}
+
+	// If no test functions, proceed with original behavior (process request table).
 	requestTable := L.GetGlobal("request")
 	if requestTable.Type() != lua.LTTable {
 		fmt.Fprintln(os.Stderr, "Error: Lua file must export a 'request' table")
@@ -129,4 +147,116 @@ func parseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 	}
 
 	return req, nil
+}
+
+// findTestFunctions returns a list of global function names starting with "test_".
+func findTestFunctions(L *lua.LState) []string {
+	var tests []string
+	L.ForEach(L.G.Global, func(key, value lua.LValue) {
+		if key.Type() == lua.LTString && value.Type() == lua.LTFunction {
+			name := string(key.(lua.LString))
+			if strings.HasPrefix(name, "test_") {
+				tests = append(tests, name)
+			}
+		}
+	})
+	return tests
+}
+
+// runTests executes test functions and reports their pass/fail status.
+func runTests(L *lua.LState, testNames []string) {
+	for _, name := range testNames {
+		fmt.Printf("Running %s... ", name)
+		err := L.CallByParam(lua.P{
+			Fn:      L.GetGlobal(name),
+			NRet:    0,
+			Protect: true,
+		}, nil)
+		if err != nil {
+			fmt.Printf("FAILED: %v\n", err)
+		} else {
+			fmt.Println("PASSED")
+		}
+	}
+}
+
+// registerRuntimeFunctions registers Lua functions for HTTP requests and assertions.
+func registerRuntimeFunctions(L *lua.LState) {
+	// Register http_request function.
+	L.SetGlobal("http_request", L.NewFunction(func(L *lua.LState) int {
+		// Expect a table as the first argument.
+		if L.GetTop() != 1 || L.Get(1).Type() != lua.LTTable {
+			L.RaiseError("http_request expects a table argument")
+			return 0
+		}
+
+		// Parse request table.
+		req, err := parseRequestTable(L, L.Get(1).(*lua.LTable))
+		if err != nil {
+			L.RaiseError("Invalid request: %v", err)
+			return 0
+		}
+
+		// Create HTTP request.
+		httpReq, err := http.NewRequest(req.Method, req.URL, strings.NewReader(req.Body))
+		if err != nil {
+			L.RaiseError("Error creating HTTP request: %v", err)
+			return 0
+		}
+
+		// Set headers.
+		for k, v := range req.Headers {
+			httpReq.Header.Set(k, v)
+		}
+
+		// Make HTTP request.
+		client := &http.Client{}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			L.RaiseError("Error making HTTP request: %v", err)
+			return 0
+		}
+		defer resp.Body.Close()
+
+		// Read response body.
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			L.RaiseError("Error reading response body: %v", err)
+			return 0
+		}
+
+		// Create response table.
+		respTable := L.NewTable()
+		L.SetField(respTable, "status_code", lua.LNumber(resp.StatusCode))
+
+		// Set headers.
+		headersTable := L.NewTable()
+		for key, values := range resp.Header {
+			for _, value := range values {
+				L.SetField(headersTable, key, lua.LString(value))
+			}
+		}
+		L.SetField(respTable, "headers", headersTable)
+
+		// Set body.
+		L.SetField(respTable, "body", lua.LString(body))
+
+		// Return response table.
+		L.Push(respTable)
+		return 1
+	}))
+
+	// Register assert_equal function.
+	L.SetGlobal("assert_equal", L.NewFunction(func(L *lua.LState) int {
+		if L.GetTop() != 2 {
+			L.RaiseError("assert_equal expects two arguments")
+			return 0
+		}
+		actual := L.Get(1)
+		expected := L.Get(2)
+		if actual.String() != expected.String() {
+			L.RaiseError("Assertion failed: expected %v, got %v", expected, actual)
+		}
+		return 0
+	}))
 }
