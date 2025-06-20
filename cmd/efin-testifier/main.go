@@ -84,8 +84,14 @@ func main() {
 		httpReq.Header.Set(k, v)
 	}
 
+	// Create HTTP client that does not follow redirects.
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	// Make HTTP request.
-	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error making HTTP request: %v\n", err)
@@ -256,8 +262,14 @@ func registerRuntimeFunctions(L *lua.LState) {
 			httpReq.Header.Set(k, v)
 		}
 
+		// Create HTTP client that does not follow redirects.
+		client := &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+
 		// Make HTTP request.
-		client := &http.Client{}
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			L.RaiseError("Error making HTTP request: %v", err)
