@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -233,7 +234,35 @@ func deepCopyTable(L *lua.LState, table *lua.LTable) *lua.LTable {
 	return newTable
 }
 
-// registerRuntimeFunctions registers Lua functions for HTTP requests and assertions.
+// jsonToLua converts a JSON value to a Lua value.
+func jsonToLua(L *lua.LState, value interface{}) lua.LValue {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		tbl := L.NewTable()
+		for key, val := range v {
+			L.SetField(tbl, key, jsonToLua(L, val))
+		}
+		return tbl
+	case []interface{}:
+		tbl := L.NewTable()
+		for i, val := range v {
+			L.RawSetInt(tbl, i+1, jsonToLua(L, val)) // Lua arrays are 1-based.
+		}
+		return tbl
+	case string:
+		return lua.LString(v)
+	case float64:
+		return lua.LNumber(v)
+	case bool:
+		return lua.LBool(v)
+	case nil:
+		return lua.LNil
+	default:
+		return lua.LNil // Unsupported types return nil.
+	}
+}
+
+// registerRuntimeFunctions registers Lua functions for HTTP requests, assertions, and JSON parsing.
 func registerRuntimeFunctions(L *lua.LState) {
 	// Register http_request function.
 	L.SetGlobal("http_request", L.NewFunction(func(L *lua.LState) int {
@@ -317,5 +346,31 @@ func registerRuntimeFunctions(L *lua.LState) {
 			L.RaiseError("Assertion failed: expected %v, got %v", expected, actual)
 		}
 		return 0
+	}))
+
+	// Register parse_json function.
+	L.SetGlobal("parse_json", L.NewFunction(func(L *lua.LState) int {
+		// Expect a string as the first argument.
+		if L.GetTop() != 1 || L.Get(1).Type() != lua.LTString {
+			L.RaiseError("parse_json expects a string argument")
+			return 0
+		}
+
+		// Get the JSON string.
+		jsonStr := string(L.Get(1).(lua.LString))
+
+		// Parse the JSON string.
+		var data interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			L.RaiseError("Invalid JSON: %v", err)
+			return 0
+		}
+
+		// Convert JSON to Lua value.
+		result := jsonToLua(L, data)
+
+		// Return the resulting table (or other Lua value).
+		L.Push(result)
+		return 1
 	}))
 }
