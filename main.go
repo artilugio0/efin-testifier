@@ -50,8 +50,11 @@ func main() {
 	// Check for test functions (functions with "test_" prefix).
 	testFunctions := findTestFunctions(L)
 	if len(testFunctions) > 0 {
-		// Run tests and report results.
-		runTests(L, testFunctions)
+		// Run preconditions and tests.
+		if err := runPreconditionsAndTests(L, testFunctions); err != nil {
+			fmt.Fprintf(os.Stderr, "Preconditions failed: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -163,21 +166,65 @@ func findTestFunctions(L *lua.LState) []string {
 	return tests
 }
 
-// runTests executes test functions and reports their pass/fail status.
-func runTests(L *lua.LState, testNames []string) {
+// runPreconditionsAndTests runs the preconditions function and tests if preconditions pass.
+func runPreconditionsAndTests(L *lua.LState, testNames []string) error {
+	// Check for preconditions function.
+	preconditions := L.GetGlobal("preconditions")
+	var context *lua.LTable
+	if preconditions.Type() == lua.LTFunction {
+		// Call preconditions.
+		err := L.CallByParam(lua.P{
+			Fn:      preconditions,
+			NRet:    1,
+			Protect: true,
+		}, nil)
+		if err != nil {
+			return err
+		}
+		// Check if preconditions returned a table.
+		if L.GetTop() > 0 {
+			result := L.Get(-1)
+			if result.Type() == lua.LTTable {
+				context = result.(*lua.LTable)
+			}
+			L.Pop(1)
+		}
+	}
+
+	// Run tests with deep-copied context.
 	for _, name := range testNames {
 		fmt.Printf("Running %s... ", name)
+		// Create a deep copy of the context table, if it exists.
+		var args []lua.LValue
+		if context != nil {
+			args = append(args, deepCopyTable(L, context))
+		}
 		err := L.CallByParam(lua.P{
 			Fn:      L.GetGlobal(name),
 			NRet:    0,
 			Protect: true,
-		}, nil)
+		}, args...)
 		if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 		} else {
 			fmt.Println("PASSED")
 		}
 	}
+	return nil
+}
+
+// deepCopyTable creates a deep copy of a Lua table.
+func deepCopyTable(L *lua.LState, table *lua.LTable) *lua.LTable {
+	newTable := L.NewTable()
+	table.ForEach(func(key, value lua.LValue) {
+		if value.Type() == lua.LTTable {
+			// Recursively copy nested tables.
+			L.SetTable(newTable, key, deepCopyTable(L, value.(*lua.LTable)))
+		} else {
+			L.SetTable(newTable, key, value)
+		}
+	})
+	return newTable
 }
 
 // registerRuntimeFunctions registers Lua functions for HTTP requests and assertions.

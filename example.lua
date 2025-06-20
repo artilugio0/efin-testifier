@@ -1,3 +1,7 @@
+function preconditions()
+  error("this should not be executed")
+end
+
 request = {
     method = "GET",
     url = "https://www.google.com",
