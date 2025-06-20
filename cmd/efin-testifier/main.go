@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 
 	lua "github.com/yuin/gopher-lua"
 )
@@ -26,6 +28,12 @@ type HTTPResponse struct {
 	Body       string
 }
 
+// testResult holds the result of a test execution.
+type testResult struct {
+	name string
+	err  error
+}
+
 func main() {
 	// Check if a Lua file is provided as an argument.
 	if len(os.Args) != 2 {
@@ -35,7 +43,7 @@ func main() {
 
 	luaFile := os.Args[1]
 
-	// Initialize Lua state.
+	// Initialize Lua state for loading the file and checking for tests.
 	L := lua.NewState()
 	defer L.Close()
 
@@ -51,8 +59,8 @@ func main() {
 	// Check for test functions (functions with "test_" prefix).
 	testFunctions := findTestFunctions(L)
 	if len(testFunctions) > 0 {
-		// Run preconditions and tests.
-		if err := runPreconditionsAndTests(L, testFunctions); err != nil {
+		// Run preconditions and tests concurrently.
+		if err := runPreconditionsAndTests(L, testFunctions, luaFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Preconditions failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -173,11 +181,11 @@ func findTestFunctions(L *lua.LState) []string {
 	return tests
 }
 
-// runPreconditionsAndTests runs the preconditions function and tests if preconditions pass.
-func runPreconditionsAndTests(L *lua.LState, testNames []string) error {
+// runPreconditionsAndTests runs the preconditions function and tests concurrently.
+func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string) error {
 	// Check for preconditions function.
-	preconditions := L.GetGlobal("preconditions")
 	var context *lua.LTable
+	preconditions := L.GetGlobal("preconditions")
 	if preconditions.Type() == lua.LTFunction {
 		// Call preconditions.
 		err := L.CallByParam(lua.P{
@@ -198,25 +206,71 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string) error {
 		}
 	}
 
-	// Run tests with deep-copied context.
+	// Sort test names for consistent reporting order.
+	sort.Strings(testNames)
+
+	// Channel to collect test results.
+	results := make(chan testResult, len(testNames))
+	var wg sync.WaitGroup
+
+	// Run each test concurrently.
 	for _, name := range testNames {
-		fmt.Printf("Running %s... ", name)
-		// Create a deep copy of the context table, if it exists.
-		var args []lua.LValue
-		if context != nil {
-			args = append(args, deepCopyTable(L, context))
-		}
-		err := L.CallByParam(lua.P{
-			Fn:      L.GetGlobal(name),
-			NRet:    0,
-			Protect: true,
-		}, args...)
-		if err != nil {
-			fmt.Printf("FAILED: %v\n", err)
+		wg.Add(1)
+		go func(testName string) {
+			defer wg.Done()
+
+			// Create a new Lua state for this test.
+			LTest := lua.NewState()
+			defer LTest.Close()
+
+			// Register runtime functions.
+			registerRuntimeFunctions(LTest)
+
+			// Load and execute the Lua file in the new state.
+			if err := LTest.DoFile(luaFile); err != nil {
+				results <- testResult{name: testName, err: fmt.Errorf("error loading Lua file: %v", err)}
+				return
+			}
+
+			// Get the test function.
+			fn := LTest.GetGlobal(testName)
+			if fn.Type() != lua.LTFunction {
+				results <- testResult{name: testName, err: fmt.Errorf("test function %s not found", testName)}
+				return
+			}
+
+			// Prepare arguments (deep-copied context if exists).
+			var args []lua.LValue
+			if context != nil {
+				args = append(args, deepCopyTable(LTest, context))
+			}
+
+			// Run the test.
+			err := LTest.CallByParam(lua.P{
+				Fn:      fn,
+				NRet:    0,
+				Protect: true,
+			}, args...)
+			results <- testResult{name: testName, err: err}
+		}(name)
+	}
+
+	// Wait for all tests to complete and close the results channel.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and print results in order.
+	for result := range results {
+		fmt.Printf("Running %s... ", result.name)
+		if result.err != nil {
+			fmt.Printf("FAILED: %v\n", result.err)
 		} else {
 			fmt.Println("PASSED")
 		}
 	}
+
 	return nil
 }
 
