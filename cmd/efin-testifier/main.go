@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/artilugio0/efin-testifier/internal/ratelimit"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -33,6 +34,9 @@ type testResult struct {
 	name string
 	err  error
 }
+
+// requestsPerSecond configures the maximum number of concurrent HTTP requests per second for tests.
+const requestsPerSecond = 10.0
 
 func main() {
 	// Check if a Lua file is provided as an argument.
@@ -93,7 +97,7 @@ func main() {
 		httpReq.Header.Set(k, v)
 	}
 
-	// Create HTTP client that does not follow redirects.
+	// Create HTTP client that does not follow redirects (no rate limiting for non-test case).
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -213,6 +217,14 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string)
 	results := make(chan testResult, len(testNames))
 	var wg sync.WaitGroup
 
+	// Create a shared rate-limited client for tests.
+	baseClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	rateLimitedClient := ratelimit.NewRateLimitedClient(baseClient, requestsPerSecond)
+
 	// Run each test concurrently.
 	for _, name := range testNames {
 		wg.Add(1)
@@ -223,8 +235,8 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string)
 			LTest := lua.NewState()
 			defer LTest.Close()
 
-			// Register runtime functions.
-			registerRuntimeFunctions(LTest)
+			// Register runtime functions with the shared rate-limited client.
+			registerRuntimeFunctionsWithClient(LTest, rateLimitedClient)
 
 			// Load and execute the Lua file in the new state.
 			if err := LTest.DoFile(luaFile); err != nil {
@@ -316,8 +328,8 @@ func jsonToLua(L *lua.LState, value interface{}) lua.LValue {
 	}
 }
 
-// registerRuntimeFunctions registers Lua functions for HTTP requests, assertions, and JSON parsing.
-func registerRuntimeFunctions(L *lua.LState) {
+// registerRuntimeFunctionsWithClient registers Lua functions with a specific HTTP client.
+func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLimitedClient) {
 	// Register http_request function.
 	L.SetGlobal("http_request", L.NewFunction(func(L *lua.LState) int {
 		// Expect a table as the first argument.
@@ -345,14 +357,7 @@ func registerRuntimeFunctions(L *lua.LState) {
 			httpReq.Header.Set(k, v)
 		}
 
-		// Create HTTP client that does not follow redirects.
-		client := &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-
-		// Make HTTP request.
+		// Make HTTP request using the rate-limited client.
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			L.RaiseError("Error making HTTP request: %v", err)
@@ -427,4 +432,16 @@ func registerRuntimeFunctions(L *lua.LState) {
 		L.Push(result)
 		return 1
 	}))
+}
+
+// registerRuntimeFunctions registers Lua functions with a default rate-limited client.
+func registerRuntimeFunctions(L *lua.LState) {
+	// Create a default rate-limited client for non-test use (though not used in main).
+	baseClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	rateLimitedClient := ratelimit.NewRateLimitedClient(baseClient, requestsPerSecond)
+	registerRuntimeFunctionsWithClient(L, rateLimitedClient)
 }
