@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -411,6 +412,48 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 
 		// Return the resulting table (or other Lua value).
 		L.Push(result)
+		return 1
+	}))
+
+	// Register urlencode function.
+	L.SetGlobal("urlencode", L.NewFunction(func(L *lua.LState) int {
+		// Expect a string as the first argument.
+		if L.GetTop() != 1 || L.Get(1).Type() != lua.LTString {
+			L.RaiseError("urlencode expects a string argument")
+			return 0
+		}
+
+		// Get the input string.
+		input := string(L.Get(1).(lua.LString))
+
+		// URL encode the string.
+		encoded := url.QueryEscape(input)
+
+		// Return the encoded string.
+		L.Push(lua.LString(encoded))
+		return 1
+	}))
+
+	// Register urldecode function.
+	L.SetGlobal("urldecode", L.NewFunction(func(L *lua.LState) int {
+		// Expect a string as the first argument.
+		if L.GetTop() != 1 || L.Get(1).Type() != lua.LTString {
+			L.RaiseError("urldecode expects a string argument")
+			return 0
+		}
+
+		// Get the input string.
+		input := string(L.Get(1).(lua.LString))
+
+		// URL decode the string.
+		decoded, err := url.QueryUnescape(input)
+		if err != nil {
+			L.RaiseError("Error decoding URL: %v", err)
+			return 0
+		}
+
+		// Return the decoded string.
+		L.Push(lua.LString(decoded))
 		return 1
 	}))
 }
