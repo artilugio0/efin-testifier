@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 
@@ -192,9 +191,6 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		}
 	}
 
-	// Sort test names for consistent reporting order.
-	sort.Strings(testNames)
-
 	// Channel to collect test results.
 	results := make(chan testResult, len(testNames))
 	var wg sync.WaitGroup
@@ -207,7 +203,10 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 	}
 	rateLimitedClient := ratelimit.NewRateLimitedClient(baseClient, requestsPerSecond)
 
-	// Run each test concurrently.
+	dynamicTestFunctionLock := sync.Mutex{}
+	dynamicTestFunction := map[string]*lua.LFunction{}
+
+	// Run each static test concurrently.
 	for _, name := range testNames {
 		wg.Add(1)
 		go func(testName string) {
@@ -246,6 +245,17 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 				Protect: true,
 			}, args...)
 			results <- testResult{name: testName, err: err}
+
+			dynamicTests := LTest.GetGlobal("_dynamic_tests")
+			if dynamicTests.Type() == lua.LTTable {
+				dynamicTests.(*lua.LTable).ForEach(func(name lua.LValue, f lua.LValue) {
+					if name.Type() == lua.LTString && f.Type() == lua.LTFunction {
+						dynamicTestFunctionLock.Lock()
+						dynamicTestFunction[testName+"__"+string(name.(lua.LString))] = f.(*lua.LFunction)
+						dynamicTestFunctionLock.Unlock()
+					}
+				})
+			}
 		}(name)
 	}
 
@@ -257,6 +267,60 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 
 	// Collect and print results in order.
 	for result := range results {
+		fmt.Printf("Running %s... ", result.name)
+		if result.err != nil {
+			fmt.Printf("FAILED: %v\n", result.err)
+		} else {
+			fmt.Println("PASSED")
+		}
+	}
+
+	dynResults := make(chan testResult, len(dynamicTestFunction))
+	var dynWg sync.WaitGroup
+
+	// Run dynamic tests concurrently.
+	for testName, fn := range dynamicTestFunction {
+		dynWg.Add(1)
+		go func(testName string, fn *lua.LFunction) {
+			defer dynWg.Done()
+
+			// Create a new Lua state for this test.
+			LTest := lua.NewState()
+			defer LTest.Close()
+
+			// Register runtime functions with the shared rate-limited client.
+			registerRuntimeFunctionsWithClient(LTest, rateLimitedClient)
+
+			// Load and execute the Lua file in the new state.
+			if err := LTest.DoFile(luaFile); err != nil {
+				dynResults <- testResult{name: testName, err: fmt.Errorf("error loading Lua file: %v", err)}
+				return
+			}
+
+			// Prepare arguments (deep-copied context if exists).
+			var args []lua.LValue
+			if context != nil {
+				args = append(args, deepCopyTable(LTest, context))
+			}
+
+			// Run the test.
+			err := LTest.CallByParam(lua.P{
+				Fn:      fn,
+				NRet:    0,
+				Protect: true,
+			}, args...)
+			dynResults <- testResult{name: testName, err: err}
+		}(testName, fn)
+	}
+
+	// Wait for all tests to complete and close the results channel.
+	go func() {
+		dynWg.Wait()
+		close(dynResults)
+	}()
+
+	// Collect and print dynamic results in order.
+	for result := range dynResults {
 		fmt.Printf("Running %s... ", result.name)
 		if result.err != nil {
 			fmt.Printf("FAILED: %v\n", result.err)
@@ -455,6 +519,29 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 		// Return the decoded string.
 		L.Push(lua.LString(decoded))
 		return 1
+	}))
+
+	L.SetGlobal("register_test", L.NewFunction(func(L *lua.LState) int {
+		// Check argument count and types
+		if L.GetTop() != 2 || L.Get(1).Type() != lua.LTString || L.Get(2).Type() != lua.LTFunction {
+			L.RaiseError("register_test expects a string and a function")
+			return 0
+		}
+
+		// Extract test name and function
+		testName := string(L.Get(1).(lua.LString))
+		testFunc := L.Get(2).(*lua.LFunction)
+
+		// Get or create _dynamic_tests table to track test names
+		dynamicTests := L.GetGlobal("_dynamic_tests")
+		if dynamicTests.Type() == lua.LTNil {
+			dynamicTests = L.NewTable()
+			L.SetGlobal("_dynamic_tests", dynamicTests)
+		}
+
+		// Add test name to _dynamic_tests table
+		L.SetField(dynamicTests.(*lua.LTable), testName, testFunc)
+		return 0
 	}))
 }
 
