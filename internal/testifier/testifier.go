@@ -54,6 +54,9 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	if len(testFunctions) > 0 {
 		// Run preconditions and tests concurrently.
 		return runPreconditionsAndTests(L, testFunctions, luaFile, requestsPerSecond)
+	} else if testRegex != nil {
+		fmt.Println("No tests matched the filter")
+		return nil
 	}
 
 	// If no test functions, proceed with original behavior (process request table).
