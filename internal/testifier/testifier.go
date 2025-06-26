@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -35,7 +36,7 @@ type testResult struct {
 	err  error
 }
 
-func Run(luaFile string, requestsPerSecond float64) error {
+func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) error {
 	// Initialize Lua state for loading the file and checking for tests.
 	L := lua.NewState()
 	defer L.Close()
@@ -48,8 +49,8 @@ func Run(luaFile string, requestsPerSecond float64) error {
 		return fmt.Errorf("Error loading Lua file: %v", err)
 	}
 
-	// Check for test functions (functions with "test_" prefix).
-	testFunctions := findTestFunctions(L)
+	// Check for test functions (functions with "test_" prefix, filtered by regex).
+	testFunctions := findTestFunctions(L, testRegex)
 	if len(testFunctions) > 0 {
 		// Run preconditions and tests concurrently.
 		return runPreconditionsAndTests(L, testFunctions, luaFile, requestsPerSecond)
@@ -152,14 +153,16 @@ func parseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 	return req, nil
 }
 
-// findTestFunctions returns a list of global function names starting with "test_".
-func findTestFunctions(L *lua.LState) []string {
+// findTestFunctions returns a list of global function names starting with "test_" that match the regex (if provided).
+func findTestFunctions(L *lua.LState, testRegex *regexp.Regexp) []string {
 	var tests []string
 	L.ForEach(L.G.Global, func(key, value lua.LValue) {
 		if key.Type() == lua.LTString && value.Type() == lua.LTFunction {
 			name := string(key.(lua.LString))
 			if strings.HasPrefix(name, "test_") {
-				tests = append(tests, name)
+				if testRegex == nil || testRegex.MatchString(name) {
+					tests = append(tests, name)
+				}
 			}
 		}
 	})
@@ -167,6 +170,7 @@ func findTestFunctions(L *lua.LState) []string {
 }
 
 // runPreconditionsAndTests runs the preconditions function and tests concurrently.
+// (Unchanged from original, included for completeness)
 func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string, requestsPerSecond float64) error {
 	// Check for preconditions function.
 	var context *lua.LTable
@@ -259,13 +263,13 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		}(name)
 	}
 
-	// Wait for all tests to complete and close the results channel.
+	// Wait for all static tests to complete and close the results channel.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect and print results in order.
+	// Collect and print static test results in order.
 	for result := range results {
 		fmt.Printf("Running %s... ", result.name)
 		if result.err != nil {
@@ -313,13 +317,13 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		}(testName, fn)
 	}
 
-	// Wait for all tests to complete and close the results channel.
+	// Wait for all dynamic tests to complete and close the results channel.
 	go func() {
 		dynWg.Wait()
 		close(dynResults)
 	}()
 
-	// Collect and print dynamic results in order.
+	// Collect and print dynamic test results in order.
 	for result := range dynResults {
 		fmt.Printf("Running %s... ", result.name)
 		if result.err != nil {
@@ -521,6 +525,7 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 		return 1
 	}))
 
+	// Register register_test function.
 	L.SetGlobal("register_test", L.NewFunction(func(L *lua.LState) int {
 		// Check argument count and types
 		if L.GetTop() != 2 || L.Get(1).Type() != lua.LTString || L.Get(2).Type() != lua.LTFunction {
