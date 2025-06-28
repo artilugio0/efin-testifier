@@ -176,6 +176,8 @@ func findTestFunctions(L *lua.LState, testRegex *regexp.Regexp) []string {
 func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string, requestsPerSecond float64) error {
 	// Check for preconditions function.
 	var context *lua.LTable
+	cleanupFunctionLock := sync.Mutex{}
+	cleanupFunctions := []*lua.LFunction{}
 
 	preconditions := L.GetGlobal("preconditions")
 	if preconditions.Type() == lua.LTFunction {
@@ -196,6 +198,18 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			}
 			L.Pop(1)
 		}
+
+		// Collect cleanup functions from preconditions.
+		cleanupTests := L.GetGlobal("_cleanup_functions")
+		if cleanupTests.Type() == lua.LTTable {
+			cleanupTests.(*lua.LTable).ForEach(func(_, value lua.LValue) {
+				if value.Type() == lua.LTFunction {
+					cleanupFunctionLock.Lock()
+					cleanupFunctions = append(cleanupFunctions, value.(*lua.LFunction))
+					cleanupFunctionLock.Unlock()
+				}
+			})
+		}
 	}
 
 	// Channel to collect test results.
@@ -212,9 +226,6 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 
 	dynamicTestFunctionLock := sync.Mutex{}
 	dynamicTestFunction := map[string]*lua.LFunction{}
-
-	cleanupFunctionLock := sync.Mutex{}
-	cleanupFunctions := []*lua.LFunction{}
 
 	// Run each static test concurrently.
 	for _, name := range testNames {
