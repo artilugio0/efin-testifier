@@ -52,7 +52,7 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	// Check for test functions (functions with "test_" prefix, filtered by regex).
 	testFunctions := findTestFunctions(L, testRegex)
 	if len(testFunctions) > 0 {
-		// Run preconditions and tests concurrently.
+		// Run preconditions, tests, and cleanup functions concurrently.
 		return runPreconditionsAndTests(L, testFunctions, luaFile, requestsPerSecond)
 	} else if testRegex != nil {
 		fmt.Println("No tests matched the filter")
@@ -172,11 +172,11 @@ func findTestFunctions(L *lua.LState, testRegex *regexp.Regexp) []string {
 	return tests
 }
 
-// runPreconditionsAndTests runs the preconditions function and tests concurrently.
-// (Unchanged from original, included for completeness)
+// runPreconditionsAndTests runs the preconditions function, tests, and cleanup functions concurrently.
 func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string, requestsPerSecond float64) error {
 	// Check for preconditions function.
 	var context *lua.LTable
+
 	preconditions := L.GetGlobal("preconditions")
 	if preconditions.Type() == lua.LTFunction {
 		// Call preconditions.
@@ -212,6 +212,9 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 
 	dynamicTestFunctionLock := sync.Mutex{}
 	dynamicTestFunction := map[string]*lua.LFunction{}
+
+	cleanupFunctionLock := sync.Mutex{}
+	cleanupFunctions := []*lua.LFunction{}
 
 	// Run each static test concurrently.
 	for _, name := range testNames {
@@ -253,6 +256,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			}, args...)
 			results <- testResult{name: testName, err: err}
 
+			// Collect dynamic tests from this test.
 			dynamicTests := LTest.GetGlobal("_dynamic_tests")
 			if dynamicTests.Type() == lua.LTTable {
 				dynamicTests.(*lua.LTable).ForEach(func(name lua.LValue, f lua.LValue) {
@@ -260,6 +264,18 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 						dynamicTestFunctionLock.Lock()
 						dynamicTestFunction[testName+"__"+string(name.(lua.LString))] = f.(*lua.LFunction)
 						dynamicTestFunctionLock.Unlock()
+					}
+				})
+			}
+
+			// Collect cleanup functions from this test.
+			cleanupTests := LTest.GetGlobal("_cleanup_functions")
+			if cleanupTests.Type() == lua.LTTable {
+				cleanupTests.(*lua.LTable).ForEach(func(_, value lua.LValue) {
+					if value.Type() == lua.LTFunction {
+						cleanupFunctionLock.Lock()
+						cleanupFunctions = append(cleanupFunctions, value.(*lua.LFunction))
+						cleanupFunctionLock.Unlock()
 					}
 				})
 			}
@@ -282,10 +298,10 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		}
 	}
 
+	// Run dynamic tests concurrently.
 	dynResults := make(chan testResult, len(dynamicTestFunction))
 	var dynWg sync.WaitGroup
 
-	// Run dynamic tests concurrently.
 	for testName, fn := range dynamicTestFunction {
 		dynWg.Add(1)
 		go func(testName string, fn *lua.LFunction) {
@@ -317,6 +333,18 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 				Protect: true,
 			}, args...)
 			dynResults <- testResult{name: testName, err: err}
+
+			// Collect cleanup functions from dynamic tests.
+			cleanupTests := LTest.GetGlobal("_cleanup_functions")
+			if cleanupTests.Type() == lua.LTTable {
+				cleanupTests.(*lua.LTable).ForEach(func(_, value lua.LValue) {
+					if value.Type() == lua.LTFunction {
+						cleanupFunctionLock.Lock()
+						cleanupFunctions = append(cleanupFunctions, value.(*lua.LFunction))
+						cleanupFunctionLock.Unlock()
+					}
+				})
+			}
 		}(testName, fn)
 	}
 
@@ -328,6 +356,60 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 
 	// Collect and print dynamic test results in order.
 	for result := range dynResults {
+		fmt.Printf("Running %s... ", result.name)
+		if result.err != nil {
+			fmt.Printf("FAILED: %v\n", result.err)
+		} else {
+			fmt.Println("PASSED")
+		}
+	}
+
+	// Run cleanup functions concurrently.
+	cleanupResults := make(chan testResult, len(cleanupFunctions))
+	var cleanupWg sync.WaitGroup
+
+	for i, fn := range cleanupFunctions {
+		cleanupWg.Add(1)
+		go func(cleanupIndex int, fn *lua.LFunction) {
+			defer cleanupWg.Done()
+
+			// Create a new Lua state for this cleanup function.
+			LCleanup := lua.NewState()
+			defer LCleanup.Close()
+
+			// Register runtime functions (in case cleanup needs them).
+			registerRuntimeFunctionsWithClient(LCleanup, rateLimitedClient)
+
+			// Load the Lua file to ensure any necessary globals are available.
+			if err := LCleanup.DoFile(luaFile); err != nil {
+				cleanupResults <- testResult{name: fmt.Sprintf("cleanup_%d", cleanupIndex+1), err: fmt.Errorf("error loading Lua file: %v", err)}
+				return
+			}
+
+			// Prepare arguments (deep-copied context if exists).
+			var args []lua.LValue
+			if context != nil {
+				args = append(args, deepCopyTable(LCleanup, context))
+			}
+
+			// Run the cleanup function.
+			err := LCleanup.CallByParam(lua.P{
+				Fn:      fn,
+				NRet:    0,
+				Protect: true,
+			}, args...)
+			cleanupResults <- testResult{name: fmt.Sprintf("cleanup_%d", cleanupIndex+1), err: err}
+		}(i, fn)
+	}
+
+	// Wait for all cleanup functions to complete and close the results channel.
+	go func() {
+		cleanupWg.Wait()
+		close(cleanupResults)
+	}()
+
+	// Collect and print cleanup results in order.
+	for result := range cleanupResults {
 		fmt.Printf("Running %s... ", result.name)
 		if result.err != nil {
 			fmt.Printf("FAILED: %v\n", result.err)
@@ -549,6 +631,29 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 
 		// Add test name to _dynamic_tests table
 		L.SetField(dynamicTests.(*lua.LTable), testName, testFunc)
+		return 0
+	}))
+
+	// Register register_cleanup function.
+	L.SetGlobal("register_cleanup", L.NewFunction(func(L *lua.LState) int {
+		// Check argument count and types
+		if L.GetTop() != 1 || L.Get(1).Type() != lua.LTFunction {
+			L.RaiseError("register_cleanup expects a function")
+			return 0
+		}
+
+		// Extract cleanup function
+		cleanupFunc := L.Get(1).(*lua.LFunction)
+
+		// Get or create _cleanup_functions table to track cleanup functions
+		cleanupFunctions := L.GetGlobal("_cleanup_functions")
+		if cleanupFunctions.Type() == lua.LTNil {
+			cleanupFunctions = L.NewTable()
+			L.SetGlobal("_cleanup_functions", cleanupFunctions)
+		}
+
+		// Append cleanup function to _cleanup_functions table
+		cleanupFunctions.(*lua.LTable).Append(cleanupFunc)
 		return 0
 	}))
 }
