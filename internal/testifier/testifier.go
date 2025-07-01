@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -37,9 +38,21 @@ type testResult struct {
 }
 
 func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) error {
+	// Get the absolute path of the Lua file and its directory.
+	luaFileAbs, err := filepath.Abs(luaFile)
+	if err != nil {
+		return fmt.Errorf("Error resolving Lua file path: %v", err)
+	}
+	luaFileDir := filepath.Dir(luaFileAbs)
+
 	// Initialize Lua state for loading the file and checking for tests.
 	L := lua.NewState()
 	defer L.Close()
+
+	// Set package.path to include the Lua file's directory.
+	if err := setLuaPackagePath(L, luaFileDir); err != nil {
+		return fmt.Errorf("Error setting Lua package path: %v", err)
+	}
 
 	// Register runtime functions for tests.
 	registerRuntimeFunctions(L, requestsPerSecond)
@@ -53,7 +66,7 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	testFunctions := findTestFunctions(L, testRegex)
 	if len(testFunctions) > 0 {
 		// Run preconditions, tests, and cleanup functions concurrently.
-		return runPreconditionsAndTests(L, testFunctions, luaFile, requestsPerSecond)
+		return runPreconditionsAndTests(L, testFunctions, luaFile, luaFileDir, requestsPerSecond)
 	} else if testRegex != nil {
 		fmt.Println("No tests matched the filter")
 		return nil
@@ -108,6 +121,21 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 		return fmt.Errorf("Error reading response body: %v", err)
 	}
 
+	return nil
+}
+
+// setLuaPackagePath prepends the given directory to Lua's package.path.
+func setLuaPackagePath(L *lua.LState, dir string) error {
+	// Get current package.path.
+	packagePath := L.GetGlobal("package").(*lua.LTable).RawGetString("path")
+	pathStr := ""
+	if packagePath.Type() == lua.LTString {
+		pathStr = string(packagePath.(lua.LString))
+	}
+
+	// Prepend the test file's directory to package.path (e.g., "/path/to/dir/?.lua").
+	newPath := filepath.Join(dir, "?.lua") + ";" + pathStr
+	L.SetField(L.GetGlobal("package"), "path", lua.LString(newPath))
 	return nil
 }
 
@@ -173,12 +201,11 @@ func findTestFunctions(L *lua.LState, testRegex *regexp.Regexp) []string {
 }
 
 // runPreconditionsAndTests runs the preconditions function, tests, and cleanup functions concurrently.
-func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string, requestsPerSecond float64) error {
+func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string, luaFileDir string, requestsPerSecond float64) error {
 	// Check for preconditions function.
 	var context *lua.LTable
 	cleanupFunctionLock := sync.Mutex{}
 	cleanupFunctions := []*lua.LFunction{}
-
 	preconditions := L.GetGlobal("preconditions")
 	if preconditions.Type() == lua.LTFunction {
 		// Call preconditions.
@@ -198,7 +225,6 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			}
 			L.Pop(1)
 		}
-
 		// Collect cleanup functions from preconditions.
 		cleanupTests := L.GetGlobal("_cleanup_functions")
 		if cleanupTests.Type() == lua.LTTable {
@@ -236,6 +262,12 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			// Create a new Lua state for this test.
 			LTest := lua.NewState()
 			defer LTest.Close()
+
+			// Set package.path for this Lua state.
+			if err := setLuaPackagePath(LTest, luaFileDir); err != nil {
+				results <- testResult{name: testName, err: fmt.Errorf("error setting Lua package path: %v", err)}
+				return
+			}
 
 			// Register runtime functions with the shared rate-limited client.
 			registerRuntimeFunctionsWithClient(LTest, rateLimitedClient)
@@ -322,6 +354,12 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			LTest := lua.NewState()
 			defer LTest.Close()
 
+			// Set package.path for this Lua state.
+			if err := setLuaPackagePath(LTest, luaFileDir); err != nil {
+				dynResults <- testResult{name: testName, err: fmt.Errorf("error setting Lua package path: %v", err)}
+				return
+			}
+
 			// Register runtime functions with the shared rate-limited client.
 			registerRuntimeFunctionsWithClient(LTest, rateLimitedClient)
 
@@ -387,6 +425,12 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			// Create a new Lua state for this cleanup function.
 			LCleanup := lua.NewState()
 			defer LCleanup.Close()
+
+			// Set package.path for this Lua state.
+			if err := setLuaPackagePath(LCleanup, luaFileDir); err != nil {
+				cleanupResults <- testResult{name: fmt.Sprintf("cleanup_%d", cleanupIndex+1), err: fmt.Errorf("error setting Lua package path: %v", err)}
+				return
+			}
 
 			// Register runtime functions (in case cleanup needs them).
 			registerRuntimeFunctionsWithClient(LCleanup, rateLimitedClient)
