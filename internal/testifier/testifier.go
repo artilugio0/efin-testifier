@@ -253,6 +253,10 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 	dynamicTestFunctionLock := sync.Mutex{}
 	dynamicTestFunction := map[string]*lua.LFunction{}
 
+	// Variables to track test results for summary
+	var staticResults []testResult
+	var dynamicResults []testResult
+
 	// Run each static test concurrently.
 	for _, name := range testNames {
 		wg.Add(1)
@@ -331,7 +335,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		close(results)
 	}()
 
-	// Collect and print static test results in order.
+	// Collect static test results in order.
 	for result := range results {
 		fmt.Printf("Running %s... ", result.name)
 		if result.err != nil {
@@ -339,6 +343,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		} else {
 			fmt.Println("PASSED")
 		}
+		staticResults = append(staticResults, result)
 	}
 
 	// Run dynamic tests concurrently.
@@ -411,6 +416,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 		} else {
 			fmt.Println("PASSED")
 		}
+		dynamicResults = append(dynamicResults, result)
 	}
 
 	// Run cleanup functions concurrently.
@@ -472,6 +478,26 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			fmt.Println("PASSED")
 		}
 	}
+
+	// Print test summary (excluding cleanup functions)
+	totalTests := len(staticResults) + len(dynamicResults)
+	passedTests := 0
+	for _, result := range staticResults {
+		if result.err == nil {
+			passedTests++
+		}
+	}
+	for _, result := range dynamicResults {
+		if result.err == nil {
+			passedTests++
+		}
+	}
+	failedTests := totalTests - passedTests
+
+	fmt.Printf("\nTest Summary:\n")
+	fmt.Printf("Total Tests: %d\n", totalTests)
+	fmt.Printf("Tests Passed: %d\n", passedTests)
+	fmt.Printf("Tests Failed: %d\n", failedTests)
 
 	return nil
 }
