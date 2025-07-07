@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/artilugio0/efin-testifier/internal/ratelimit"
 	lua "github.com/yuin/gopher-lua"
@@ -146,7 +147,10 @@ func parseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 	// Get method.
 	method := L.GetField(table, "method")
 	if method.Type() != lua.LTString {
-		return req, fmt.Errorf("'method' must be a string")
+		if method.Type() != lua.LTNil {
+			return req, fmt.Errorf("'method' must be a string")
+		}
+		method = lua.LString("GET")
 	}
 	req.Method = string(method.(lua.LString))
 	if req.Method == "" {
@@ -544,6 +548,43 @@ func jsonToLua(L *lua.LState, value interface{}) lua.LValue {
 	}
 }
 
+// cookieToLua converts an http.Cookie to a Lua table.
+func cookieToLua(L *lua.LState, cookie *http.Cookie) *lua.LTable {
+	tbl := L.NewTable()
+	L.SetField(tbl, "name", lua.LString(cookie.Name))
+	L.SetField(tbl, "value", lua.LString(cookie.Value))
+	if cookie.Path != "" {
+		L.SetField(tbl, "path", lua.LString(cookie.Path))
+	}
+	if cookie.Domain != "" {
+		L.SetField(tbl, "domain", lua.LString(cookie.Domain))
+	}
+	if !cookie.Expires.IsZero() {
+		L.SetField(tbl, "expires", lua.LString(cookie.Expires.Format(time.RFC1123)))
+	}
+	L.SetField(tbl, "secure", lua.LBool(cookie.Secure))
+	L.SetField(tbl, "http_only", lua.LBool(cookie.HttpOnly))
+	if cookie.SameSite != http.SameSite(0) {
+		sameSiteStr := ""
+		switch cookie.SameSite {
+		case http.SameSiteDefaultMode:
+			sameSiteStr = "Default"
+		case http.SameSiteLaxMode:
+			sameSiteStr = "Lax"
+		case http.SameSiteStrictMode:
+			sameSiteStr = "Strict"
+		case http.SameSiteNoneMode:
+			sameSiteStr = "None"
+		}
+		L.SetField(tbl, "same_site", lua.LString(sameSiteStr))
+	}
+
+	L.SetField(tbl, "set_cookie_string", lua.LString(cookie.String()))
+	L.SetField(tbl, "key_value", lua.LString(cookie.Name+"="+cookie.Value))
+
+	return tbl
+}
+
 // registerRuntimeFunctionsWithClient registers Lua functions with a specific HTTP client.
 func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLimitedClient) {
 	// Register http_request function.
@@ -595,9 +636,11 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 		// Set headers.
 		headersTable := L.NewTable()
 		for key, values := range resp.Header {
+			valuesList := L.NewTable()
 			for _, value := range values {
-				L.SetField(headersTable, key, lua.LString(value))
+				valuesList.Append(lua.LString(value))
 			}
+			L.SetField(headersTable, key, valuesList)
 		}
 		L.SetField(respTable, "headers", headersTable)
 
@@ -688,6 +731,67 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 
 		// Return the decoded string.
 		L.Push(lua.LString(decoded))
+		return 1
+	}))
+
+	// Register get_set_cookie function.
+	L.SetGlobal("get_set_cookie", L.NewFunction(func(L *lua.LState) int {
+		// Expect a table (response) and a string (cookie name) as arguments.
+		if L.GetTop() != 2 || L.Get(1).Type() != lua.LTTable || L.Get(2).Type() != lua.LTString {
+			L.RaiseError("get_cookie expects a response table and a cookie name string")
+			return 0
+		}
+
+		// Get response table and cookie name.
+		respTable := L.Get(1).(*lua.LTable)
+		cookieName := string(L.Get(2).(lua.LString))
+
+		// Get headers from response table.
+		headers := L.GetField(respTable, "headers")
+		if headers.Type() != lua.LTTable {
+			L.RaiseError("response.headers must be a table")
+			return 0
+		}
+
+		// Get Set-Cookie headers.
+		setCookieHeaders := L.GetField(headers.(*lua.LTable), "Set-Cookie")
+		if setCookieHeaders.Type() == lua.LTNil {
+			// No Set-Cookie headers, return nil.
+			L.Push(lua.LNil)
+			return 1
+		}
+
+		// Parse Set-Cookie headers.
+		var cookies []*http.Cookie
+		if setCookieHeaders.Type() == lua.LTTable {
+			// Handle multiple Set-Cookie headers as a table.
+			setCookieHeaders.(*lua.LTable).ForEach(func(_, value lua.LValue) {
+				if value.Type() == lua.LTString {
+					cookie, err := http.ParseSetCookie(string(value.(lua.LString)))
+					if err == nil {
+						cookies = append(cookies, cookie)
+					}
+				}
+			})
+		} else if setCookieHeaders.Type() == lua.LTString {
+			// Handle single Set-Cookie header (unlikely but possible).
+			cookie, err := http.ParseSetCookie(string(setCookieHeaders.(lua.LString)))
+			if err == nil {
+				cookies = append(cookies, cookie)
+			}
+		}
+
+		// Find the cookie with the specified name.
+		for _, cookie := range cookies {
+			if cookie.Name == cookieName {
+				// Convert cookie to Lua table and return.
+				L.Push(cookieToLua(L, cookie))
+				return 1
+			}
+		}
+
+		// Cookie not found, return nil.
+		L.Push(lua.LNil)
 		return 1
 	}))
 
