@@ -79,6 +79,16 @@ func ParseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 		headersTable.ForEach(func(key, value lua.LValue) {
 			if key.Type() == lua.LTString && value.Type() == lua.LTString {
 				req.Headers[string(key.(lua.LString))] = string(value.(lua.LString))
+			} else if key.Type() == lua.LTString && value.Type() == lua.LTTable {
+				// Handle case where the header contains multiple values
+				// TODO: change HTTPRequest to handle multiple values for same header
+				tbl := value.(*lua.LTable)
+				for i := range tbl.Len() {
+					v := tbl.RawGetInt(i + 1)
+					if v.Type() == lua.LTString {
+						req.Headers[string(key.(lua.LString))] = string(v.(lua.LString))
+					}
+				}
 			}
 		})
 	}
