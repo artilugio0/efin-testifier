@@ -56,7 +56,7 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	}
 
 	// Register runtime functions for tests.
-	registerRuntimeFunctions(L, requestsPerSecond)
+	RegisterRuntimeFunctions(L, requestsPerSecond)
 
 	// Load and execute the Lua file.
 	if err := L.DoFile(luaFile); err != nil {
@@ -278,7 +278,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			}
 
 			// Register runtime functions with the shared rate-limited client.
-			registerRuntimeFunctionsWithClient(LTest, rateLimitedClient)
+			RegisterRuntimeFunctionsWithClient(LTest, rateLimitedClient)
 
 			// Load and execute the Lua file in the new state.
 			if err := LTest.DoFile(luaFile); err != nil {
@@ -370,7 +370,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			}
 
 			// Register runtime functions with the shared rate-limited client.
-			registerRuntimeFunctionsWithClient(LTest, rateLimitedClient)
+			RegisterRuntimeFunctionsWithClient(LTest, rateLimitedClient)
 
 			// Load and execute the Lua file in the new state.
 			if err := LTest.DoFile(luaFile); err != nil {
@@ -443,7 +443,7 @@ func runPreconditionsAndTests(L *lua.LState, testNames []string, luaFile string,
 			}
 
 			// Register runtime functions (in case cleanup needs them).
-			registerRuntimeFunctionsWithClient(LCleanup, rateLimitedClient)
+			RegisterRuntimeFunctionsWithClient(LCleanup, rateLimitedClient)
 
 			// Load the Lua file to ensure any necessary globals are available.
 			if err := LCleanup.DoFile(luaFile); err != nil {
@@ -585,8 +585,8 @@ func cookieToLua(L *lua.LState, cookie *http.Cookie) *lua.LTable {
 	return tbl
 }
 
-// registerRuntimeFunctionsWithClient registers Lua functions with a specific HTTP client.
-func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLimitedClient) {
+// RegisterRuntimeFunctionsWithClient registers Lua functions with a specific HTTP client.
+func RegisterRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLimitedClient) {
 	// Register http_request function.
 	L.SetGlobal("http_request", L.NewFunction(func(L *lua.LState) int {
 		// Expect a table as the first argument.
@@ -843,8 +843,8 @@ func registerRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.RateLim
 	}))
 }
 
-// registerRuntimeFunctions registers Lua functions with a default rate-limited client.
-func registerRuntimeFunctions(L *lua.LState, requestsPerSecond float64) {
+// RegisterRuntimeFunctions registers Lua functions with a default rate-limited client.
+func RegisterRuntimeFunctions(L *lua.LState, requestsPerSecond float64) {
 	// Create a default rate-limited client for non-test use (though not used in main).
 	baseClient := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -852,5 +852,5 @@ func registerRuntimeFunctions(L *lua.LState, requestsPerSecond float64) {
 		},
 	}
 	rateLimitedClient := ratelimit.NewRateLimitedClient(baseClient, requestsPerSecond)
-	registerRuntimeFunctionsWithClient(L, rateLimitedClient)
+	RegisterRuntimeFunctionsWithClient(L, rateLimitedClient)
 }
