@@ -193,7 +193,7 @@ func HTTPRequestToTable(L *lua.LState, req HTTPRequest) *lua.LTable {
 	for _, h := range req.Headers {
 		valuesList, ok := hts[h.Name]
 		if !ok {
-			valuesList := L.NewTable()
+			valuesList = L.NewTable()
 			hts[h.Name] = valuesList
 			L.SetField(headersTable, h.Name, valuesList)
 		}
