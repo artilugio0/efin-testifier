@@ -132,9 +132,6 @@ func rawHTTPRequestFromTable(L *lua.LState, table *lua.LTable) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("invalid URL: %s", req.URL)
-	}
 
 	path := u.Path
 	if path == "" {
@@ -164,7 +161,7 @@ func rawHTTPRequestFromTable(L *lua.LState, table *lua.LTable) (string, error) {
 		}
 	}
 
-	if !hasHost {
+	if !hasHost && u.Host != "" {
 		headers = append(headers, fmt.Sprintf("Host: %s", u.Host))
 	}
 
@@ -185,9 +182,8 @@ func HTTPRequestToTable(L *lua.LState, req HTTPRequest) *lua.LTable {
 	reqTable := L.NewTable()
 	L.SetField(reqTable, "method", lua.LString(req.Method))
 
-	L.SetField(reqTable, "url", lua.LString(req.URL))
-
 	// Set headers.
+	host := "unknown"
 	headersTable := L.NewTable()
 	hts := map[string]*lua.LTable{}
 	for _, h := range req.Headers {
@@ -198,7 +194,12 @@ func HTTPRequestToTable(L *lua.LState, req HTTPRequest) *lua.LTable {
 			L.SetField(headersTable, h.Name, valuesList)
 		}
 		valuesList.Append(lua.LString(h.Value))
+		if strings.EqualFold(h.Name, "Host") {
+			host = h.Value
+		}
 	}
+	L.SetField(reqTable, "url", lua.LString("https://"+host+req.URL))
+
 	L.SetField(reqTable, "headers", headersTable)
 
 	L.SetField(reqTable, "body", lua.LString(req.Body))
