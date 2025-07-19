@@ -63,7 +63,7 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	}
 
 	// Convert Lua table to HTTPRequest struct.
-	req, err := liblua.ParseRequestTable(L, requestTable.(*lua.LTable))
+	req, err := liblua.HTTPRequestFromTable(L, requestTable.(*lua.LTable))
 	if err != nil {
 		return fmt.Errorf("Error: %v", err)
 	}
@@ -75,8 +75,8 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	}
 
 	// Set headers.
-	for k, v := range req.Headers {
-		httpReq.Header.Set(k, v)
+	for _, h := range req.Headers {
+		httpReq.Header.Add(h.Name, h.Value)
 	}
 
 	// Create HTTP client that does not follow redirects (no rate limiting for non-test case).

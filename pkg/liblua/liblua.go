@@ -14,38 +14,17 @@ import (
 	lua "github.com/yuin/gopher-lua"
 )
 
+// TODO: move these HTTP core definitions to their own package
 // HTTPRequest represents the structure of an HTTP request from Lua.
 type HTTPRequest struct {
 	Method  string
 	URL     string
-	Headers map[string]string
+	Headers []HeaderEntry
 	Body    string
 }
 
-// HTTPResponse represents the structure of an HTTP response to Lua.
-type HTTPResponse struct {
-	StatusCode int
-	Headers    map[string]string
-	Body       string
-}
-
-// SetLuaPackagePath prepends the given directory to Lua's package.path.
-func SetLuaPackagePath(L *lua.LState, dir string) error {
-	// Get current package.path.
-	packagePath := L.GetGlobal("package").(*lua.LTable).RawGetString("path")
-	pathStr := ""
-	if packagePath.Type() == lua.LTString {
-		pathStr = string(packagePath.(lua.LString))
-	}
-
-	// Prepend the test file's directory to package.path (e.g., "/path/to/dir/?.lua").
-	newPath := filepath.Join(dir, "?.lua") + ";" + pathStr
-	L.SetField(L.GetGlobal("package"), "path", lua.LString(newPath))
-	return nil
-}
-
-// ParseRequestTable converts a Lua table to an HTTPRequest struct.
-func ParseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
+// HTTPRequestFromTable converts a Lua table to an HTTPRequest struct.
+func HTTPRequestFromTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 	var req HTTPRequest
 
 	// Get method.
@@ -72,25 +51,65 @@ func ParseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 	}
 
 	// Get headers (optional).
-	req.Headers = make(map[string]string)
+	req.Headers = []HeaderEntry{}
 	headers := L.GetField(table, "headers")
 	if headers.Type() == lua.LTTable {
 		headersTable := headers.(*lua.LTable)
-		headersTable.ForEach(func(key, value lua.LValue) {
-			if key.Type() == lua.LTString && value.Type() == lua.LTString {
-				req.Headers[string(key.(lua.LString))] = string(value.(lua.LString))
-			} else if key.Type() == lua.LTString && value.Type() == lua.LTTable {
+
+		if headersTable.Len() > 0 {
+			// Headers table is an array
+			for i := range headersTable.Len() {
+				keyValue, ok := headersTable.RawGetInt(i + 1).(*lua.LTable)
+				if !ok {
+					continue
+				}
+				k, ok := keyValue.RawGetInt(1).(lua.LString)
+				if !ok {
+					continue
+				}
+				v, ok := keyValue.RawGetInt(2).(lua.LString)
+				if !ok {
+					continue
+				}
+
+				req.Headers = append(req.Headers, HeaderEntry{
+					Name:  string(k),
+					Value: string(v),
+				})
+			}
+		} else {
+			// Headers table is a map
+			headersTable.ForEach(func(key, value lua.LValue) {
+				if key.Type() != lua.LTString {
+					return
+				}
+
+				// Handle case where the header contains one values
+				if value.Type() == lua.LTString {
+					req.Headers = append(req.Headers, HeaderEntry{
+						Name:  string(key.(lua.LString)),
+						Value: string(value.(lua.LString)),
+					})
+					return
+				}
+
 				// Handle case where the header contains multiple values
-				// TODO: change HTTPRequest to handle multiple values for same header
+				if value.Type() != lua.LTTable {
+					return
+				}
+
 				tbl := value.(*lua.LTable)
 				for i := range tbl.Len() {
 					v := tbl.RawGetInt(i + 1)
 					if v.Type() == lua.LTString {
-						req.Headers[string(key.(lua.LString))] = string(v.(lua.LString))
+						req.Headers = append(req.Headers, HeaderEntry{
+							Name:  string(key.(lua.LString)),
+							Value: string(v.(lua.LString)),
+						})
 					}
 				}
-			}
-		})
+			})
+		}
 	}
 
 	// Get body (optional).
@@ -100,6 +119,387 @@ func ParseRequestTable(L *lua.LState, table *lua.LTable) (HTTPRequest, error) {
 	}
 
 	return req, nil
+}
+
+// rawHTTPRequestFromTable converts a Lua table to a raw HTTP request string.
+func rawHTTPRequestFromTable(L *lua.LState, table *lua.LTable) (string, error) {
+	req, err := HTTPRequestFromTable(L, table)
+	if err != nil {
+		return "", err
+	}
+
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid URL: %s", req.URL)
+	}
+
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	if u.RawQuery != "" {
+		path += "?" + u.RawQuery
+	}
+	if u.Fragment != "" {
+		path += "#" + u.Fragment
+	}
+
+	requestLine := fmt.Sprintf("%s %s HTTP/1.1", req.Method, path)
+
+	var headers []string
+	hasHost := false
+	hasContentLength := false
+	for _, h := range req.Headers {
+		headerLine := fmt.Sprintf("%s: %s", h.Name, h.Value)
+		headers = append(headers, headerLine)
+
+		if strings.EqualFold(h.Name, "Host") {
+			hasHost = true
+		}
+		if strings.EqualFold(h.Name, "Content-Length") {
+			hasContentLength = true
+		}
+	}
+
+	if !hasHost {
+		headers = append(headers, fmt.Sprintf("Host: %s", u.Host))
+	}
+
+	body := req.Body
+	if !hasContentLength && body != "" {
+		headers = append(headers, fmt.Sprintf("Content-Length: %d", len(body)))
+	}
+
+	headerStr := strings.Join(headers, "\n")
+
+	raw := requestLine + "\n" + headerStr + "\n\n" + body
+	return raw, nil
+}
+
+// HTTPRequestToTable converts a HTTPRequest struct to a Lua table.
+func HTTPRequestToTable(L *lua.LState, req HTTPRequest) *lua.LTable {
+	// Create request table.
+	reqTable := L.NewTable()
+	L.SetField(reqTable, "method", lua.LString(req.Method))
+
+	L.SetField(reqTable, "url", lua.LString(req.URL))
+
+	// Set headers.
+	headersTable := L.NewTable()
+	hts := map[string]*lua.LTable{}
+	for _, h := range req.Headers {
+		valuesList, ok := hts[h.Name]
+		if !ok {
+			valuesList := L.NewTable()
+			hts[h.Name] = valuesList
+			L.SetField(headersTable, h.Name, valuesList)
+		}
+		valuesList.Append(lua.LString(h.Value))
+	}
+	L.SetField(reqTable, "headers", headersTable)
+
+	L.SetField(reqTable, "body", lua.LString(req.Body))
+
+	// Set the metatable with __tostring
+	mt := L.NewTable()
+	mt.RawSetString("__tostring", L.NewFunction(func(L *lua.LState) int {
+		table := L.CheckTable(1)
+
+		raw, err := rawHTTPRequestFromTable(L, table)
+		if err != nil {
+			L.Push(lua.LString(fmt.Sprintf("Error generating raw HTTP: %v", err)))
+			return 1
+		}
+
+		L.Push(lua.LString(raw))
+		return 1
+	}))
+	L.SetMetatable(reqTable, mt)
+
+	return reqTable
+}
+
+type HeaderEntry struct {
+	Name  string
+	Value string
+}
+
+// HTTPResponse represents the structure of an HTTP response to Lua.
+type HTTPResponse struct {
+	StatusCode int
+	Headers    []HeaderEntry
+	Body       string
+}
+
+// HTTPResponseToTable converts a HTTPResponse struct to a Lua table.
+func HTTPResponseToTable(L *lua.LState, resp HTTPResponse) *lua.LTable {
+	// Create response table.
+	respTable := L.NewTable()
+	L.SetField(respTable, "status_code", lua.LNumber(resp.StatusCode))
+
+	// Set headers.
+	headersTable := L.NewTable()
+	hts := map[string]*lua.LTable{}
+	for _, h := range resp.Headers {
+		valuesList, ok := hts[h.Name]
+		if !ok {
+			valuesList = L.NewTable()
+			hts[h.Name] = valuesList
+			L.SetField(headersTable, h.Name, valuesList)
+		}
+		valuesList.Append(lua.LString(h.Value))
+	}
+	L.SetField(respTable, "headers", headersTable)
+
+	L.SetField(respTable, "body", lua.LString(resp.Body))
+
+	// Set metatable with __tostring
+	mt := L.NewTable()
+	mt.RawSetString("__tostring", L.NewFunction(func(L *lua.LState) int {
+		table := L.CheckTable(1)
+		raw, err := rawHTTPResponseFromTable(L, table)
+		if err != nil {
+			L.Push(lua.LString(fmt.Sprintf("Error generating raw HTTP response: %v", err)))
+			return 1
+		}
+		L.Push(lua.LString(raw))
+		return 1
+	}))
+	L.SetMetatable(respTable, mt)
+
+	return respTable
+}
+
+// HTTPResponseFromTable converts a Lua table to an HTTPResponse struct.
+func HTTPResponseFromTable(L *lua.LState, table *lua.LTable) (HTTPResponse, error) {
+	var resp HTTPResponse
+
+	// Get Status Code.
+	statusCode := L.GetField(table, "status_code")
+	if statusCode.Type() != lua.LTNumber {
+		return resp, fmt.Errorf("'status_code' must be a number")
+	}
+	resp.StatusCode = int(statusCode.(lua.LNumber))
+
+	// Get headers (optional).
+	resp.Headers = []HeaderEntry{}
+	headers := L.GetField(table, "headers")
+	if headers.Type() == lua.LTTable {
+		headersTable := headers.(*lua.LTable)
+
+		if headersTable.Len() > 0 {
+			// Headers table is an array
+			for i := range headersTable.Len() {
+				keyValue, ok := headersTable.RawGetInt(i + 1).(*lua.LTable)
+				if !ok {
+					continue
+				}
+				k, ok := keyValue.RawGetInt(1).(lua.LString)
+				if !ok {
+					continue
+				}
+				v, ok := keyValue.RawGetInt(2).(lua.LString)
+				if !ok {
+					continue
+				}
+
+				resp.Headers = append(resp.Headers, HeaderEntry{
+					Name:  string(k),
+					Value: string(v),
+				})
+			}
+		} else {
+			// Headers table is a map
+			headersTable.ForEach(func(key, value lua.LValue) {
+				if key.Type() != lua.LTString {
+					return
+				}
+
+				// Handle case where the header contains one values
+				if value.Type() == lua.LTString {
+					resp.Headers = append(resp.Headers, HeaderEntry{
+						Name:  string(key.(lua.LString)),
+						Value: string(value.(lua.LString)),
+					})
+					return
+				}
+
+				// Handle case where the header contains multiple values
+				if value.Type() != lua.LTTable {
+					return
+				}
+
+				tbl := value.(*lua.LTable)
+				for i := range tbl.Len() {
+					v := tbl.RawGetInt(i + 1)
+					if v.Type() == lua.LTString {
+						resp.Headers = append(resp.Headers, HeaderEntry{
+							Name:  string(key.(lua.LString)),
+							Value: string(v.(lua.LString)),
+						})
+					}
+				}
+			})
+		}
+	}
+
+	// Get body (optional).
+	body := L.GetField(table, "body")
+	if body.Type() == lua.LTString {
+		resp.Body = string(body.(lua.LString))
+	}
+
+	return resp, nil
+}
+
+// rawHTTPResponseFromTable converts a Lua table to a raw HTTP response string.
+func rawHTTPResponseFromTable(L *lua.LState, table *lua.LTable) (string, error) {
+	var resp HTTPResponse
+
+	// Get status_code.
+	status := L.GetField(table, "status_code")
+	if status.Type() != lua.LTNumber {
+		return "", fmt.Errorf("'status_code' must be a number")
+	}
+	resp.StatusCode = int(status.(lua.LNumber))
+
+	// Get headers (optional).
+	resp.Headers = []HeaderEntry{}
+	headers := L.GetField(table, "headers")
+	if headers.Type() == lua.LTTable {
+		headersTable := headers.(*lua.LTable)
+
+		if headersTable.Len() > 0 {
+			// Headers table is an array
+			for i := range headersTable.Len() {
+				keyValue, ok := headersTable.RawGetInt(i + 1).(*lua.LTable)
+				if !ok {
+					continue
+				}
+				k, ok := keyValue.RawGetInt(1).(lua.LString)
+				if !ok {
+					continue
+				}
+				v, ok := keyValue.RawGetInt(2).(lua.LString)
+				if !ok {
+					continue
+				}
+
+				resp.Headers = append(resp.Headers, HeaderEntry{
+					Name:  string(k),
+					Value: string(v),
+				})
+			}
+		} else {
+			// Headers table is a map
+			headersTable.ForEach(func(key, value lua.LValue) {
+				if key.Type() != lua.LTString {
+					return
+				}
+
+				// Handle case where the header contains one values
+				if value.Type() == lua.LTString {
+					resp.Headers = append(resp.Headers, HeaderEntry{
+						Name:  string(key.(lua.LString)),
+						Value: string(value.(lua.LString)),
+					})
+					return
+				}
+
+				// Handle case where the header contains multiple values
+				if value.Type() != lua.LTTable {
+					return
+				}
+
+				tbl := value.(*lua.LTable)
+				for i := range tbl.Len() {
+					v := tbl.RawGetInt(i + 1)
+					if v.Type() == lua.LTString {
+						resp.Headers = append(resp.Headers, HeaderEntry{
+							Name:  string(key.(lua.LString)),
+							Value: string(v.(lua.LString)),
+						})
+					}
+				}
+			})
+		}
+	}
+
+	// Get body (optional).
+	body := L.GetField(table, "body")
+	if body.Type() == lua.LTString {
+		resp.Body = string(body.(lua.LString))
+	}
+
+	// Build raw response
+	reason := http.StatusText(resp.StatusCode)
+	responseLine := fmt.Sprintf("HTTP/1.1 %d %s", resp.StatusCode, reason)
+
+	var headersStr []string
+	hasContentLength := false
+	for _, h := range resp.Headers {
+		headerLine := fmt.Sprintf("%s: %s", h.Name, h.Value)
+		headersStr = append(headersStr, headerLine)
+		if strings.EqualFold(h.Name, "Content-Length") {
+			hasContentLength = true
+		}
+	}
+
+	bodyStr := resp.Body
+	if !hasContentLength && bodyStr != "" {
+		headersStr = append(headersStr, fmt.Sprintf("Content-Length: %d", len(bodyStr)))
+	}
+
+	headerStr := strings.Join(headersStr, "\n")
+
+	raw := responseLine + "\n" + headerStr + "\n\n" + bodyStr
+	return raw, nil
+}
+
+// asHTTPResponse converts an *http.Response to HTTPResponse.
+func asHTTPResponse(resp *http.Response) (HTTPResponse, error) {
+	var httpResp HTTPResponse
+
+	// Set StatusCode
+	httpResp.StatusCode = resp.StatusCode
+
+	// Read Body
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return httpResp, fmt.Errorf("failed to read response body: %w", err)
+	}
+	defer resp.Body.Close() // Ensure body is closed after reading
+	httpResp.Body = string(bodyBytes)
+
+	// Set Headers
+	for name, values := range resp.Header {
+		for _, value := range values {
+			httpResp.Headers = append(httpResp.Headers, HeaderEntry{
+				Name:  name,
+				Value: value,
+			})
+		}
+	}
+
+	return httpResp, nil
+}
+
+// SetLuaPackagePath prepends the given directory to Lua's package.path.
+func SetLuaPackagePath(L *lua.LState, dir string) error {
+	// Get current package.path.
+	packagePath := L.GetGlobal("package").(*lua.LTable).RawGetString("path")
+	pathStr := ""
+	if packagePath.Type() == lua.LTString {
+		pathStr = string(packagePath.(lua.LString))
+	}
+
+	// Prepend the test file's directory to package.path (e.g., "/path/to/dir/?.lua").
+	newPath := filepath.Join(dir, "?.lua") + ";" + pathStr
+	L.SetField(L.GetGlobal("package"), "path", lua.LString(newPath))
+	return nil
 }
 
 // JsonToLua converts a JSON value to a Lua value.
@@ -178,7 +578,7 @@ func RegisterCommonRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.R
 		}
 
 		// Parse request table.
-		req, err := ParseRequestTable(L, L.Get(1).(*lua.LTable))
+		req, err := HTTPRequestFromTable(L, L.Get(1).(*lua.LTable))
 		if err != nil {
 			L.RaiseError("Invalid request: %v", err)
 			return 0
@@ -192,8 +592,8 @@ func RegisterCommonRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.R
 		}
 
 		// Set headers.
-		for k, v := range req.Headers {
-			httpReq.Header.Set(k, v)
+		for _, h := range req.Headers {
+			httpReq.Header.Add(h.Name, h.Value)
 		}
 
 		// Make HTTP request using the rate-limited client.
@@ -204,30 +604,13 @@ func RegisterCommonRuntimeFunctionsWithClient(L *lua.LState, client *ratelimit.R
 		}
 		defer resp.Body.Close()
 
-		// Read response body.
-		body, err := io.ReadAll(resp.Body)
+		httpResp, err := asHTTPResponse(resp)
 		if err != nil {
-			L.RaiseError("Error reading response body: %v", err)
+			L.RaiseError("%v", err)
 			return 0
 		}
 
-		// Create response table.
-		respTable := L.NewTable()
-		L.SetField(respTable, "status_code", lua.LNumber(resp.StatusCode))
-
-		// Set headers.
-		headersTable := L.NewTable()
-		for key, values := range resp.Header {
-			valuesList := L.NewTable()
-			for _, value := range values {
-				valuesList.Append(lua.LString(value))
-			}
-			L.SetField(headersTable, key, valuesList)
-		}
-		L.SetField(respTable, "headers", headersTable)
-
-		// Set body.
-		L.SetField(respTable, "body", lua.LString(body))
+		respTable := HTTPResponseToTable(L, httpResp)
 
 		// Return response table.
 		L.Push(respTable)
