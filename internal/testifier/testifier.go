@@ -94,7 +94,7 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	defer resp.Body.Close()
 
 	// Print raw HTTP response.
-	fmt.Printf("HTTP/%s %s\n", resp.Proto, resp.Status)
+	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
 	for key, values := range resp.Header {
 		for _, value := range values {
 			fmt.Printf("%s: %s\n", key, value)
