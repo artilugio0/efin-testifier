@@ -19,6 +19,7 @@ const (
 
 // NewTestifierCmd creates the root command with backwards compatibility
 func NewTestifierCmd(name string) *cobra.Command {
+	var bodyOnly bool
 	var rootCmd = &cobra.Command{
 		Use:   name,
 		Short: "HTTP requests testing tool",
@@ -38,6 +39,7 @@ Or use explicit subcommands:
 				switch args[0] {
 				case "run":
 					runCmd := NewRunCmd()
+					runCmd.Flags().Set("body-only", cmd.Flags().Lookup("body-only").Value.String())
 					runCmd.SetArgs(args[1:])
 					if err := runCmd.Execute(); err != nil {
 						os.Exit(1)
@@ -56,6 +58,7 @@ Or use explicit subcommands:
 				default:
 					// Assume it's a file path - backwards compatibility
 					runCmd := NewRunCmd()
+					runCmd.Flags().Set("body-only", cmd.Flags().Lookup("body-only").Value.String())
 					runCmd.SetArgs(args)
 					if err := runCmd.Execute(); err != nil {
 						os.Exit(1)
@@ -68,6 +71,8 @@ Or use explicit subcommands:
 		},
 	}
 
+	rootCmd.Flags().BoolVarP(&bodyOnly, "body-only", "b", false, "Only print the response body")
+
 	return rootCmd
 }
 
@@ -75,6 +80,7 @@ Or use explicit subcommands:
 func NewRunCmd() *cobra.Command {
 	var requestsPerSecond float64
 	var testRegex string
+	var bodyOnly bool
 
 	var runCmd = &cobra.Command{
 		Use:   "run <lua_file>",
@@ -91,7 +97,7 @@ func NewRunCmd() *cobra.Command {
 					os.Exit(1)
 				}
 			}
-			if err := testifier.Run(args[0], requestsPerSecond, compiledRegex); err != nil {
+			if err := testifier.Run(args[0], requestsPerSecond, compiledRegex, bodyOnly); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -111,6 +117,13 @@ func NewRunCmd() *cobra.Command {
 		"t",
 		"",
 		"Regex pattern to filter static test names (e.g., 'test_.*_api')",
+	)
+	runCmd.Flags().BoolVarP(
+		&bodyOnly,
+		"body-only",
+		"b",
+		false,
+		"Only print the response body",
 	)
 
 	return runCmd

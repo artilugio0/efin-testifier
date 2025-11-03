@@ -21,7 +21,7 @@ type testResult struct {
 	err  error
 }
 
-func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) error {
+func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp, bodyOnly bool) error {
 	// Get the absolute path of the Lua file and its directory.
 	luaFileAbs, err := filepath.Abs(luaFile)
 	if err != nil {
@@ -94,13 +94,15 @@ func Run(luaFile string, requestsPerSecond float64, testRegex *regexp.Regexp) er
 	defer resp.Body.Close()
 
 	// Print raw HTTP response.
-	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
-	for key, values := range resp.Header {
-		for _, value := range values {
-			fmt.Printf("%s: %s\n", key, value)
+	if !bodyOnly {
+		fmt.Printf("%s %s\n", resp.Proto, resp.Status)
+		for key, values := range resp.Header {
+			for _, value := range values {
+				fmt.Printf("%s: %s\n", key, value)
+			}
 		}
+		fmt.Println()
 	}
-	fmt.Println()
 	if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
 		return fmt.Errorf("Error reading response body: %v", err)
 	}
